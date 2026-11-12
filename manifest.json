@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Street View Stitcher",
+  "version": "1.0.0",
+  "description": "Fetch and stitch the current Street View panorama's tiles, then save a clean 16:9 image of the scene.",
+  "minimum_chrome_version": "109",
+  "permissions": ["offscreen", "storage"],
+  "host_permissions": [
+    "*://www.google.com/maps*",
+    "*://maps.google.com/*",
+    "*://*.googleapis.com/*",
+    "*://*.ggpht.com/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["*://www.google.com/maps*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}
