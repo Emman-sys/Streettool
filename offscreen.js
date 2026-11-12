@@ -6,7 +6,7 @@ const MAX_TILES = 2200;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function tileUrls(pano, x, y, z) {
-  const q = `cb_client=apiv3&panoid=${encodeURIComponent(pano)}&x=${x}&y=${y}&zoom=${z}&nbt=1&fover=2`;
+  const q = `cb_client=apiv3&panoid=${encodeURIComponent(pano)}&x=${x}&y=${y}&zoom=${z}&fover=2`;
   return [
     `https://streetviewpixels-pa.googleapis.com/v1/tile?${q}`,
     `https://cbk0.googleapis.com/cbk?${q}&output=tile`,
@@ -84,7 +84,7 @@ function buildRegion(cam, outW, outH, d) {
 
 /* ---------------- stitching ---------------- */
 
-async function stitch(pano, region, onProgress) {
+async function stitch(pano, region, onProgress, underlay) {
   const { z, W, H, nx, ny, x0, y0, width, height } = region;
 
   const canvas = document.createElement('canvas');
@@ -93,6 +93,20 @@ async function stitch(pano, region, onProgress) {
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = '#c8c8c8';
   ctx.fillRect(0, 0, width, height);
+  if (underlay) {
+    const scale = W / underlay.region.W;
+    ctx.drawImage(
+      underlay.canvas,
+      0,
+      0,
+      underlay.canvas.width,
+      underlay.canvas.height,
+      underlay.region.x0 * scale - x0,
+      underlay.region.y0 * scale - y0,
+      underlay.canvas.width * scale,
+      underlay.canvas.height * scale
+    );
+  }
 
   const jobs = [];
   const w0 = Math.floor(x0 / W), w1 = Math.floor((x0 + width - 1) / W);
@@ -110,6 +124,7 @@ async function stitch(pano, region, onProgress) {
   const total = jobs.length;
   let done = 0;
   let missing = 0;
+  const failed = [];
 
   onProgress?.(0, total);
   await pool(jobs, async ({ wrap, tx, ty }) => {
@@ -121,10 +136,22 @@ async function stitch(pano, region, onProgress) {
       bmp.close?.();
     } else {
       missing++;
+      failed.push({ wrap, tx, ty });
     }
     done++;
     if (done % 4 === 0 || done === total) onProgress?.(done, total);
   }, CONCURRENCY);
+
+  failed.sort((a, b) => a.ty - b.ty);
+  for (const { wrap, tx, ty } of failed) {
+    if (ty === 0) continue;
+    const dx = wrap * W + tx * TILE - x0;
+    const dy = ty * TILE - y0;
+    const vw = Math.min(TILE, W - tx * TILE);
+    const vh = Math.min(TILE, H - ty * TILE);
+    if (dy < 1 || dx + vw <= 0 || dx >= width) continue;
+    ctx.drawImage(canvas, dx, dy - 1, vw, 1, dx, dy, vw, vh);
+  }
 
   return { canvas, missing, total };
 }
@@ -263,7 +290,8 @@ async function run(payload) {
     throw new Error('Invalid camera parameters.');
   }
 
-  const d = panoDims(imgW, imgH, Math.max(0, Math.min(MAX_ZOOM, zoom | 0)));
+  const requestedZoom = Math.max(0, Math.min(MAX_ZOOM, zoom | 0));
+  const d = panoDims(imgW, imgH, requestedZoom);
   const report = (phase, done, total) =>
     chrome.runtime.sendMessage({ target: 'content', tabId, reqId, phase, done, total }).catch(() => {});
 
@@ -271,8 +299,26 @@ async function run(payload) {
     ? { ...d, x0: 0, y0: 0, width: d.W, height: d.H }
     : buildRegion(camera, outW, outH, d);
 
+  let underlay;
+  if (requestedZoom === MAX_ZOOM) {
+    const normalD = panoDims(imgW, imgH, Math.min(3, requestedZoom));
+    const normalRegion = mode === 'pano'
+      ? { ...normalD, x0: 0, y0: 0, width: normalD.W, height: normalD.H }
+      : buildRegion(camera, outW, outH, normalD);
+    report('fetch', 0, 1);
+    underlay = {
+      ...await stitch(pano, normalRegion, (done, total) => report('fetch', done, total)),
+      region: normalRegion
+    };
+  }
+
   report('fetch', 0, 1);
-  const { canvas, missing, total: tiles } = await stitch(pano, region, (d, t) => report('fetch', d, t));
+  const { canvas, missing, total: tiles } = await stitch(
+    pano,
+    region,
+    (done, total) => report('fetch', done, total),
+    underlay
+  );
 
   report('render', 0, 1);
   const finalCanvas =
