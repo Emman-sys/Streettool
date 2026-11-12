@@ -3,7 +3,8 @@
   window.__svsLoaded = true;
 
   let reqId = 0;
-  let busy = false;
+  let activeCaptures = 0;
+  let latestCaptureId = 0;
   let lastUrl = '';
   let centreLookupPano = '';
   let centreLookupToken = 0;
@@ -133,7 +134,6 @@
   }
 
   function syncFromUrl() {
-    if (busy) return;
     const s = readState();
     console.debug('[Street View Stitcher] Syncing camera controls', {
       yaw: s.yaw,
@@ -341,15 +341,14 @@
   }
 
   async function capture(mode) {
-    if (busy) return;
     const pano = $('svs-pano').value.trim();
     if (!pano) { setStatus('No panorama id — pan around in Street View first.', true); return; }
 
     const [outW, outH] = $('svs-size').value.split('x').map(Number);
     const rawPitch = Number($('svs-pitch').value);
     const id = ++reqId;
-    busy = true;
-    goBtn.disabled = rawBtn.disabled = true;
+    latestCaptureId = id;
+    activeCaptures++;
     setStatus('Starting…');
 
     try {
@@ -411,15 +410,21 @@
       const name = mode === 'pano' ? `streetview-pano-${pano}.png` : `streetview-${pano}-${stamp}.png`;
       download(res.dataUrl, name);
 
-      setStatus(
-        `Saved ${mode === 'pano' ? 'panorama' : outW + '×' + outH + ' view'}` +
-          (res.missing ? ` · ${res.missing}/${res.tiles} tiles unavailable` : '')
-      );
+      if (id === latestCaptureId) {
+        setStatus(
+          `Saved ${mode === 'pano' ? 'panorama' : outW + '×' + outH + ' view'}` +
+            (res.missing ? ` · ${res.missing}/${res.tiles} tiles unavailable` : '')
+        );
+      }
     } catch (e) {
-      setStatus(String(e?.message || e), true);
+      if (id === latestCaptureId) setStatus(String(e?.message || e), true);
     } finally {
-      busy = false;
-      goBtn.disabled = rawBtn.disabled = false;
+      activeCaptures--;
+      if (id === latestCaptureId && activeCaptures > 0) {
+        setStatus(`${activeCaptures} other capture${activeCaptures === 1 ? '' : 's'} still stitching…`);
+      } else if (activeCaptures === 0) {
+        setStatus('All captures complete.');
+      }
     }
   }
 
@@ -427,7 +432,7 @@
   rawBtn.addEventListener('click', () => capture('pano'));
   window.addEventListener('keydown', (e) => {
     if ((e.key && e.key.toLowerCase() !== 'p') || e.code !== 'KeyP' ||
-        e.ctrlKey || e.metaKey || e.altKey || e.repeat || busy) return;
+        e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
     const target = e.target;
     if (target instanceof HTMLInputElement || target instanceof HTMLSelectElement ||
         target instanceof HTMLTextAreaElement || target.isContentEditable) return;
@@ -438,7 +443,7 @@
   }, true);
 
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg?.target !== 'content' || msg.reqId !== reqId) return;
+    if (msg?.target !== 'content' || msg.reqId !== latestCaptureId) return;
     if (msg.phase === 'fetch') {
       barEl.style.width = Math.round((msg.done / Math.max(1, msg.total)) * 100) + '%';
       setStatus(`Fetching tiles ${msg.done}/${msg.total}…`);

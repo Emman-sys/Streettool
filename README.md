@@ -16,6 +16,8 @@ and restored when Street View loads a new frame. The panorama centre heading
 is looked up from Google’s panorama metadata for each new panorama, with the
 manual value retained if metadata is unavailable. Press `P` anywhere on the
 Street View page to quickly save the current 16:9 view.
+You can start another capture while a previous capture is still stitching; each
+capture uses the camera state from when it was started.
 
 Notes:
 - Tile quality 3 is the sweet spot. 4 and 5 pull far more requests.
