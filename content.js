@@ -7,6 +7,7 @@
   let lastUrl = '';
   let centreLookupPano = '';
   let centreLookupToken = 0;
+  let panoSize = null;
 
   const fab = document.createElement('button');
   fab.id = 'svs-fab';
@@ -106,7 +107,15 @@
   const DEG = Math.PI / 180;
   const norm360 = (heading) => ((heading % 360) + 360) % 360;
 
-  function readCamera(manualHeading, manualCentreHeading, manualPitch, manualFov, manualRoll, outW, outH) {
+  function readCamera(
+    manualHeading,
+    manualCentreHeading,
+    manualPitch,
+    manualFov,
+    manualRoll,
+    outW,
+    outH
+  ) {
     const hfov = Number.isFinite(manualFov) ? manualFov * DEG : 90 * DEG;
     const vfov = 2 * Math.atan(Math.tan(hfov / 2) * (outH / outW));
     const limit = Math.max(0, Math.PI / 2 - vfov / 2);
@@ -146,6 +155,7 @@
     }
 
     async function lookupCentreHeading(pano, token) {
+      panoSize = null;
       const url =
         'https://www.google.com/maps/photometa/v1?authuser=0&hl=en&pb=' +
         '!1m4!1smaps_sv.tactile!11m2!2m1!1b1!2m2!1sen!2sus!3m3!1m2!1e2!2s' +
@@ -183,6 +193,13 @@
           });
           return;
         }
+        if (token !== centreLookupToken) {
+          console.debug('[Street View Stitcher] Ignoring stale PhotoMeta response', { pano, token });
+          return;
+        }
+        const sz = metadata?.[1]?.[0]?.[2]?.[2];
+        if (Array.isArray(sz) && sz[0] > 0 && sz[1] > 0) panoSize = { pano, w: sz[1], h: sz[0] };
+        console.info('[Street View Stitcher] Pano size', sz);
         const panoHeading = metadata?.[1]?.[0]?.[5]?.[0]?.[1]?.[2]?.[0];
         if (!Number.isFinite(panoHeading)) {
           console.warn('[Street View Stitcher] PhotoMeta has no positional panorama heading; keeping manual centre heading', {
@@ -382,7 +399,9 @@
           zoom: Number($('svs-zoom').value),
           outW,
           outH,
-          mode
+          mode,
+          imgW: panoSize?.pano === pano ? panoSize.w : undefined,
+          imgH: panoSize?.pano === pano ? panoSize.h : undefined
         }
       });
 

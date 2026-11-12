@@ -45,11 +45,20 @@ async function pool(items, worker, limit) {
 
 /* ---------------- geometry ---------------- */
 
-function buildRegion(pano, cam, outW, outH, zoom) {
-  const n = 1 << zoom;
-  const W = n * TILE;
-  const hTiles = Math.max(1, n >> 1);
-  const H = hTiles * TILE;
+function panoDims(imgW, imgH, zoom) {
+  if (!imgW || !imgH) {
+    const n = 1 << zoom, ny = Math.max(1, n >> 1);
+    return { z: zoom, W: n * TILE, H: ny * TILE, nx: n, ny };
+  }
+  const maxZ = Math.ceil(Math.log2(imgW / TILE));
+  const z = Math.min(zoom, maxZ);
+  const s = 2 ** (maxZ - z);
+  const W = Math.round(imgW / s), H = Math.round(imgH / s);
+  return { z, W, H, nx: Math.ceil(W / TILE), ny: Math.ceil(H / TILE) };
+}
+
+function buildRegion(cam, outW, outH, d) {
+  const { W, H } = d;
 
   const hFov = cam.hfov;
   const vFov = 2 * Math.atan(Math.tan(hFov / 2) * (outH / outW));
@@ -58,31 +67,25 @@ function buildRegion(pano, cam, outW, outH, zoom) {
   const pxX = W / (2 * Math.PI);
   const pxY = H / Math.PI;
 
-  const yawSpan = Math.min(2 * Math.PI, hFov * margin);
-  const pitchSpan = Math.min(Math.PI, vFov * margin);
+  // Roll rotates the horizontal and vertical extents into each other. Use
+  // the diagonal ray angle for both axes so every reprojected corner is
+  // covered by the fetched equirectangular band.
+  const rayExtent = Math.atan(Math.hypot(Math.tan(hFov / 2), Math.tan(vFov / 2)));
+  const yawSpan = Math.min(2 * Math.PI, 2 * rayExtent * margin);
+  const pitchSpan = Math.min(Math.PI, 2 * rayExtent * margin);
 
-  let x0 = (cam.yaw + Math.PI) * pxX - (yawSpan / 2) * pxX;
-  let x1 = x0 + yawSpan * pxX;
-  let y0 = (Math.PI / 2 - (cam.pitch + pitchSpan / 2)) * pxY;
-  let y1 = (Math.PI / 2 - (cam.pitch - pitchSpan / 2)) * pxY;
+  const x0 = Math.floor((cam.yaw + Math.PI) * pxX - (yawSpan / 2) * pxX) - 2;
+  const x1 = Math.ceil(x0 + yawSpan * pxX) + 4;
+  const y0 = Math.max(0, Math.floor((Math.PI / 2 - (cam.pitch + pitchSpan / 2)) * pxY) - 2);
+  const y1 = Math.min(H, Math.ceil((Math.PI / 2 - (cam.pitch - pitchSpan / 2)) * pxY) + 2);
 
-  x0 = Math.floor(x0 / TILE) * TILE - TILE;
-  x1 = Math.ceil(x1 / TILE) * TILE + TILE;
-  y0 = Math.max(0, Math.floor(y0 / TILE) * TILE - TILE);
-  y1 = Math.min(H, Math.ceil(y1 / TILE) * TILE + TILE);
-
-  const tx0 = Math.floor(x0 / TILE);
-  const tx1 = Math.ceil(x1 / TILE);
-  const ty0 = Math.floor(y0 / TILE);
-  const ty1 = Math.ceil(y1 / TILE);
-
-  return { n, hTiles, W, H, x0, y0, width: x1 - x0, height: y1 - y0, tx0, tx1, ty0, ty1 };
+  return { ...d, x0, y0, width: x1 - x0, height: y1 - y0 };
 }
 
 /* ---------------- stitching ---------------- */
 
-async function stitch(pano, region, zoom, onProgress) {
-  const { n, hTiles, x0, y0, width, height, tx0, tx1, ty0, ty1 } = region;
+async function stitch(pano, region, onProgress) {
+  const { z, W, H, nx, ny, x0, y0, width, height } = region;
 
   const canvas = document.createElement('canvas');
   canvas.width = width;
@@ -92,20 +95,29 @@ async function stitch(pano, region, zoom, onProgress) {
   ctx.fillRect(0, 0, width, height);
 
   const jobs = [];
-  for (let ty = ty0; ty < ty1; ty++) {
-    if (ty < 0 || ty >= hTiles) continue;
-    for (let tx = tx0; tx < tx1; tx++) jobs.push({ tx, ty });
+  const w0 = Math.floor(x0 / W), w1 = Math.floor((x0 + width - 1) / W);
+  const ty0 = Math.floor(y0 / TILE), ty1 = Math.floor((y0 + height - 1) / TILE);
+  for (let wrap = w0; wrap <= w1; wrap++) {
+    for (let tx = 0; tx < nx; tx++) {
+      const px = wrap * W + tx * TILE;
+      if (px + TILE <= x0 || px >= x0 + width) continue;
+      for (let ty = Math.max(0, ty0); ty <= Math.min(ny - 1, ty1); ty++) jobs.push({ wrap, tx, ty });
+    }
   }
+
+  if (jobs.length > MAX_TILES) throw new Error(`Too many tiles (${jobs.length}). Lower the quality level.`);
 
   const total = jobs.length;
   let done = 0;
   let missing = 0;
 
-  await pool(jobs, async ({ tx, ty }) => {
-    const wx = ((tx % n) + n) % n;
-    const bmp = await fetchTile(pano, wx, ty, zoom);
+  onProgress?.(0, total);
+  await pool(jobs, async ({ wrap, tx, ty }) => {
+    const bmp = await fetchTile(pano, tx, ty, z);
     if (bmp) {
-      ctx.drawImage(bmp, tx * TILE - x0, ty * TILE - y0);
+      const vw = Math.min(TILE, W - tx * TILE, bmp.width);
+      const vh = Math.min(TILE, H - ty * TILE, bmp.height);
+      ctx.drawImage(bmp, 0, 0, vw, vh, wrap * W + tx * TILE - x0, ty * TILE - y0, vw, vh);
       bmp.close?.();
     } else {
       missing++;
@@ -115,6 +127,13 @@ async function stitch(pano, region, zoom, onProgress) {
   }, CONCURRENCY);
 
   return { canvas, missing, total };
+}
+
+async function probeSize(pano) {
+  const has = async (x, y) => !!(await fetchTile(pano, x, y, 5));
+  if (await has(31, 15)) return { imgW: 16384, imgH: 8192 };
+  if (await has(25, 12)) return { imgW: 13312, imgH: 6656 };
+  return null;
 }
 
 /* ---------------- reprojection ---------------- */
@@ -133,6 +152,7 @@ function renderView(src, region, outW, outH, cam) {
 
   const tanH = Math.tan(cam.hfov / 2);
   const tanV = tanH * (outH / outW);
+  const distortion = Number.isFinite(cam.distortion) ? cam.distortion : 0;
 
   const sample = (fx, fy, o) => {
     if (fx < 0 || fy < 0 || fx > width - 1 || fy > height - 1) {
@@ -158,15 +178,19 @@ function renderView(src, region, outW, outH, cam) {
   let maxV = 0;
   let bandMisses = 0;
   for (let y = 0; y < outH; y++) {
-    const v = (0.5 - (y + 0.5) / outH) * 2 * tanV;
     for (let x = 0; x < outW; x++) {
     const u = (x + 0.5) / outW;
-    const rayX = (u - 0.5) * 2 * tanH;
+    const centeredX = (u - 0.5) * 2;
+    const centeredY = ((y + 0.5) / outH - 0.5) * -2;
+    const radius2 = centeredX * centeredX + centeredY * centeredY;
+    const correction = 1 + distortion * radius2;
+    const rayX = centeredX * tanH * correction;
     const z0 = 1;
+    const correctedV = centeredY * tanV * correction;
 
     const rollCos = Math.cos(-cam.roll), rollSin = Math.sin(-cam.roll);
-    const x1 = rayX * rollCos - v * rollSin;
-    const y1 = rayX * rollSin + v * rollCos;
+    const x1 = rayX * rollCos - correctedV * rollSin;
+    const y1 = rayX * rollSin + correctedV * rollCos;
     const pitchCos = Math.cos(cam.pitch), pitchSin = Math.sin(cam.pitch);
     const y2 = y1 * pitchCos + z0 * pitchSin;
     const z2 = -y1 * pitchSin + z0 * pitchCos;
@@ -179,12 +203,12 @@ function renderView(src, region, outW, outH, cam) {
     const az = Math.atan2(x2, z3);
 
       const sourceU = 0.5 + az / (2 * Math.PI);
-      const sourceX = ((sourceU % 1) + 1) % 1 * (W - 1);
+      const sourceX = ((sourceU % 1) + 1) % 1 * W;
       const lat = Math.asin(y2 / len);
       const sourceV = 0.5 - lat / Math.PI;
       minV = Math.min(minV, sourceV);
       maxV = Math.max(maxV, sourceV);
-      const sourceY = sourceV * (H - 1);
+      const sourceY = sourceV * H;
       if (sourceY < y0 || sourceY > y0 + height - 1) bandMisses++;
 
       const sampleX = sourceX + Math.ceil((x0 - sourceX) / W) * W;
@@ -217,6 +241,8 @@ function renderView(src, region, outW, outH, cam) {
 
 async function run(payload) {
   const { pano, camera, zoom, outW, outH, mode, reqId, tabId } = payload;
+  let { imgW, imgH } = payload;
+  if (!imgW) ({ imgW, imgH } = (await probeSize(pano)) || {});
   console.info('[Street View Stitcher] Stitch request', {
     pano,
     reqId,
@@ -237,27 +263,16 @@ async function run(payload) {
     throw new Error('Invalid camera parameters.');
   }
 
-  const z = Math.max(0, Math.min(MAX_ZOOM, zoom | 0));
+  const d = panoDims(imgW, imgH, Math.max(0, Math.min(MAX_ZOOM, zoom | 0)));
   const report = (phase, done, total) =>
     chrome.runtime.sendMessage({ target: 'content', tabId, reqId, phase, done, total }).catch(() => {});
 
-  let region;
-  if (mode === 'pano') {
-    const n = 1 << z;
-    const hTiles = Math.max(1, n >> 1);
-    const size = n * TILE;
-    const height = hTiles * TILE;
-    region = { n, hTiles, W: size, H: height, x0: 0, y0: 0, width: size, height, tx0: 0, tx1: n, ty0: 0, ty1: hTiles };
-  } else {
-    region = buildRegion(pano, camera, outW, outH, z);
-  }
+  const region = mode === 'pano'
+    ? { ...d, x0: 0, y0: 0, width: d.W, height: d.H }
+    : buildRegion(camera, outW, outH, d);
 
-  const tiles =
-    (region.tx1 - region.tx0) * (region.ty1 - region.ty0);
-  if (tiles > MAX_TILES) throw new Error(`Too many tiles (${tiles}). Lower the quality level.`);
-
-  report('fetch', 0, tiles);
-  const { canvas, missing } = await stitch(pano, region, z, (d, t) => report('fetch', d, t));
+  report('fetch', 0, 1);
+  const { canvas, missing, total: tiles } = await stitch(pano, region, (d, t) => report('fetch', d, t));
 
   report('render', 0, 1);
   const finalCanvas =

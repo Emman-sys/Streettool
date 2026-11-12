@@ -5,7 +5,7 @@ async function offscreenExists() {
   if (chrome.runtime.getContexts) {
     const ctxs = await chrome.runtime.getContexts({
       contextTypes: ['OFFSCREEN_DOCUMENT']
-    });
+    });a
     return ctxs.length > 0;
   }
   return chrome.offscreen.hasDocument();
